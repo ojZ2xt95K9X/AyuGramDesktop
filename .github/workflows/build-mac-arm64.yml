@@ -1,76 +1,90 @@
-# Build macOS (arm64 only)
-name: Build macOS (arm64)
+name: Build AyuGram macOS
 
 on:
-  workflow_dispatch:
   push:
-    branches:
-      - main
+    branches: [ main, dev ]
   pull_request:
-    branches:
-      - main
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  TDESKTOP_API_ID: 2040
+  TDESKTOP_API_HASH: b18441a1ff607e10a989891a5462e627
 
 jobs:
-  build-macos-arm64:
+  build-macos:
     runs-on: macos-14
-    env:
-      TDESKTOP_API_ID: ${{ secrets.TDESKTOP_API_ID }}
-      TDESKTOP_API_HASH: ${{ secrets.TDESKTOP_API_HASH }}
-      # enforce arm64 for any CMake-based steps that read this env
-      CMAKE_OSX_ARCHITECTURES: arm64
-
+    
     steps:
-      - name: Checkout repository (with submodules)
-        uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - name: Show Xcode & system info
-        run: |
-          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer || true
-          xcodebuild -version || true
-          sw_vers || true
-          uname -m || true
-
-      - name: Install Homebrew packages required for build
-        run: |
-          brew update
-          brew install automake cmake wget pkg-config gnu-tar ninja nasm meson || true
-
-      - name: Prepare libraries (mac.sh)
-        working-directory: ./tdesktop/Telegram
-        env:
-          CMAKE_OSX_ARCHITECTURES: arm64
-        run: |
-          chmod +x build/prepare/mac.sh
-          # If mac.sh accepts an arch parameter use it; otherwise the env above forces arm64 to CMake
-          ./build/prepare/mac.sh || true
-
-      - name: Run configure.sh (force arm64)
-        working-directory: ./tdesktop/Telegram
-        env:
-          TDESKTOP_API_ID: ${{ secrets.TDESKTOP_API_ID }}
-          TDESKTOP_API_HASH: ${{ secrets.TDESKTOP_API_HASH }}
-          CMAKE_OSX_ARCHITECTURES: arm64
-        run: |
-          if [ -z "${TDESKTOP_API_ID}" ] || [ -z "${TDESKTOP_API_HASH}" ]; then
-            echo "ERROR: TDESKTOP_API_ID and TDESKTOP_API_HASH must be set as repository secrets."
-            exit 1
-          fi
-          chmod +x configure.sh
-          # Pass the CMake arch flag explicitly as well
-          ./configure.sh -D TDESKTOP_API_ID=${TDESKTOP_API_ID} -D TDESKTOP_API_HASH=${TDESKTOP_API_HASH} -D CMAKE_OSX_ARCHITECTURES=arm64
-
-      - name: Build with xcodebuild (Release, arm64)
-        working-directory: ./tdesktop/out
-        run: |
-          set -e
-          # Build Release configuration for arm64. Adjust -scheme if your project uses a different scheme name.
-          xcodebuild -project Telegram.xcodeproj -configuration Release -scheme Telegram -derivedDataPath build -arch arm64 CODE_SIGNING_ALLOWED=NO
-
-      - name: Collect build artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: Telegram-mac-arm64-Release
-          path: ./tdesktop/out/build/Build/Products/Release/Telegram.app
+    - name: Check available disk space
+      run: |
+        df -h
+        echo "Note: Build requires ~55GB free space"
+    
+    - name: Install Xcode
+      uses: maxim-lobanov/setup-xcode@v1
+      with:
+        xcode-version: '16.1'
+    
+    - name: Set Xcode path
+      run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+    
+    - name: Install Homebrew dependencies
+      run: |
+        brew install git automake cmake wget pkg-config gnu-tar ninja nasm meson
+    
+    - name: Clone AyuGramDesktop repository
+      run: |
+        git clone --recursive https://github.com/AyuGram/AyuGramDesktop.git tdesktop
+        cd tdesktop
+        echo "Cloned commit: $(git rev-parse HEAD)"
+    
+    - name: Prepare libraries
+      run: |
+        cd tdesktop/Telegram/build/prepare
+        chmod +x mac.sh
+        ./mac.sh
+    
+    - name: Configure build
+      run: |
+        cd tdesktop/Telegram
+        ./configure.sh -D TDESKTOP_API_ID=${{ env.TDESKTOP_API_ID }} -D TDESKTOP_API_HASH=${{ env.TDESKTOP_API_HASH }}
+    
+    - name: Build with xcodebuild
+      run: |
+        cd tdesktop/out
+        xcodebuild -project Telegram.xcodeproj \
+          -scheme Telegram \
+          -configuration Release \
+          -arch arm64 \
+          CODE_SIGN_IDENTITY="" \
+          CODE_SIGNING_REQUIRED=NO \
+          CODE_SIGNING_ALLOWED=NO
+    
+    - name: Check build output
+      run: |
+        ls -lah tdesktop/out/Release/
+        du -sh tdesktop/out/
+    
+    - name: Create DMG (optional)
+      run: |
+        cd tdesktop/out/Release
+        if [ -d "Telegram.app" ]; then
+          hdiutil create -volname "AyuGram" -srcfolder Telegram.app -ov -format UDZO AyuGram.dmg
+        fi
+    
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: AyuGram-macOS
+        path: |
+          tdesktop/out/Release/Telegram.app
+          tdesktop/out/Release/*.dmg
+        retention-days: 7
+    
+    - name: Cleanup to save space
+      if: always()
+      run: |
+        df -h
+        rm -rf tdesktop/out/Release/*.o
+        rm -rf tdesktop/out/Release/*.a
