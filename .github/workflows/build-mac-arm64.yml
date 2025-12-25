@@ -1,0 +1,76 @@
+# Build macOS (arm64 only)
+name: Build macOS (arm64)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build-macos-arm64:
+    runs-on: macos-14
+    env:
+      TDESKTOP_API_ID: ${{ secrets.TDESKTOP_API_ID }}
+      TDESKTOP_API_HASH: ${{ secrets.TDESKTOP_API_HASH }}
+      # enforce arm64 for any CMake-based steps that read this env
+      CMAKE_OSX_ARCHITECTURES: arm64
+
+    steps:
+      - name: Checkout repository (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Show Xcode & system info
+        run: |
+          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer || true
+          xcodebuild -version || true
+          sw_vers || true
+          uname -m || true
+
+      - name: Install Homebrew packages required for build
+        run: |
+          brew update
+          brew install automake cmake wget pkg-config gnu-tar ninja nasm meson || true
+
+      - name: Prepare libraries (mac.sh)
+        working-directory: ./tdesktop/Telegram
+        env:
+          CMAKE_OSX_ARCHITECTURES: arm64
+        run: |
+          chmod +x build/prepare/mac.sh
+          # If mac.sh accepts an arch parameter use it; otherwise the env above forces arm64 to CMake
+          ./build/prepare/mac.sh || true
+
+      - name: Run configure.sh (force arm64)
+        working-directory: ./tdesktop/Telegram
+        env:
+          TDESKTOP_API_ID: ${{ secrets.TDESKTOP_API_ID }}
+          TDESKTOP_API_HASH: ${{ secrets.TDESKTOP_API_HASH }}
+          CMAKE_OSX_ARCHITECTURES: arm64
+        run: |
+          if [ -z "${TDESKTOP_API_ID}" ] || [ -z "${TDESKTOP_API_HASH}" ]; then
+            echo "ERROR: TDESKTOP_API_ID and TDESKTOP_API_HASH must be set as repository secrets."
+            exit 1
+          fi
+          chmod +x configure.sh
+          # Pass the CMake arch flag explicitly as well
+          ./configure.sh -D TDESKTOP_API_ID=${TDESKTOP_API_ID} -D TDESKTOP_API_HASH=${TDESKTOP_API_HASH} -D CMAKE_OSX_ARCHITECTURES=arm64
+
+      - name: Build with xcodebuild (Release, arm64)
+        working-directory: ./tdesktop/out
+        run: |
+          set -e
+          # Build Release configuration for arm64. Adjust -scheme if your project uses a different scheme name.
+          xcodebuild -project Telegram.xcodeproj -configuration Release -scheme Telegram -derivedDataPath build -arch arm64 CODE_SIGNING_ALLOWED=NO
+
+      - name: Collect build artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Telegram-mac-arm64-Release
+          path: ./tdesktop/out/build/Build/Products/Release/Telegram.app
