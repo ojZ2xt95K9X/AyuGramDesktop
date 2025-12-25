@@ -1,0 +1,223 @@
+name: Build AyuGram macOS
+
+on:
+  push:
+    branches: [ main, dev ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  TDESKTOP_API_ID: 2040
+  TDESKTOP_API_HASH: b18441a1ff607e10a989891a5462e627
+
+jobs:
+  build-macos:
+    runs-on: macos-14
+    timeout-minutes: 180  # 3小时超时
+    
+    steps:
+    - name: Check available disk space
+      run: |
+        df -h
+        echo "Note: Build requires ~55GB free space"
+    
+    - name: Install Xcode
+      uses: maxim-lobanov/setup-xcode@v1
+      with:
+        xcode-version: '16.1'
+    
+    - name: Set Xcode path
+      run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+    
+    - name: Install Homebrew dependencies
+      run: |
+        brew install git automake cmake wget pkg-config gnu-tar ninja nasm meson
+    
+    - name: Clone AyuGramDesktop repository
+      run: |
+        git clone --recursive https://github.com/AyuGram/AyuGramDesktop.git tdesktop
+        cd tdesktop
+        echo "Cloned commit: $(git rev-parse HEAD)"
+        echo "COMMIT_HASH=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+    
+    # 缓存已编译的库文件
+    - name: Cache Libraries
+      id: cache-libs
+      uses: actions/cache@v4
+      with:
+        path: |
+          Libraries
+          tdesktop/out/Debug/ThirdParty
+          tdesktop/out/Release/ThirdParty
+        key: macos-libs-${{ runner.os }}-${{ hashFiles('tdesktop/Telegram/build/prepare/mac.sh', 'tdesktop/.gitmodules') }}
+        restore-keys: |
+          macos-libs-${{ runner.os }}-
+    
+    - name: Prepare libraries
+      if: steps.cache-libs.outputs.cache-hit != 'true'
+      timeout-minutes: 150  # 2.5小时超时
+      run: |
+        echo "缓存未命中，开始编译库（预计需要90-120分钟）..."
+        echo "开始时间: $(date)"
+        
+        # 增加文件描述符限制
+        ulimit -n 4096
+        
+        cd tdesktop/Telegram/build/prepare
+        chmod +x mac.sh
+        
+        # 使用 script 命令强制刷新输出
+        script -q /tmp/build.log ./mac.sh &
+        BUILD_PID=$!
+        
+        echo "构建进程 PID: $BUILD_PID"
+        
+        LAST_SIZE=0
+        STUCK_COUNT=0
+        
+        # 每30秒检查进度
+        while kill -0 $BUILD_PID 2>/dev/null; do
+          sleep 30
+          
+          CURRENT_SIZE=$(wc -c < /tmp/build.log 2>/dev/null || echo 0)
+          
+          if [ "$CURRENT_SIZE" -gt "$LAST_SIZE" ]; then
+            # 有新输出，重置卡住计数
+            STUCK_COUNT=0
+            echo "⏰ [$(date +%H:%M:%S)] 运行中... (已运行 $((SECONDS/60)) 分钟, 日志: ${CURRENT_SIZE} 字节)"
+            echo "最新10行:"
+            tail -10 /tmp/build.log | head -10
+            echo "---"
+          else
+            # 没有新输出
+            STUCK_COUNT=$((STUCK_COUNT + 1))
+            echo "⚠️  [$(date +%H:%M:%S)] 无新输出 (${STUCK_COUNT}/10)"
+            
+            if [ $STUCK_COUNT -ge 10 ]; then
+              echo "❌ 进程可能卡住了（5分钟无输出），终止并显示日志..."
+              kill -9 $BUILD_PID 2>/dev/null || true
+              echo "最后100行日志:"
+              tail -100 /tmp/build.log
+              exit 1
+            fi
+          fi
+          
+          LAST_SIZE=$CURRENT_SIZE
+        done
+        
+        wait $BUILD_PID
+        BUILD_EXIT=$?
+        
+        echo "构建完成时间: $(date)"
+        echo "总运行时间: $((SECONDS/60)) 分钟"
+        
+        if [ $BUILD_EXIT -ne 0 ]; then
+          echo "❌ 构建失败！错误代码: $BUILD_EXIT"
+          echo "最后100行日志："
+          tail -100 /tmp/build.log
+          exit $BUILD_EXIT
+        fi
+        
+        echo "✅ 库编译成功！"
+        
+        # 显示编译结果
+        echo "编译的库:"
+        ls -lh ../../../Libraries/local/ 2>/dev/null || true
+    
+    - name: Libraries cache status
+      if: steps.cache-libs.outputs.cache-hit == 'true'
+      run: |
+        echo "✅ 使用缓存的库文件，跳过编译！"
+        ls -lah Libraries/ || echo "Libraries目录检查"
+    
+    # 缓存构建产物
+    - name: Cache Build Objects
+      uses: actions/cache@v4
+      with:
+        path: |
+          tdesktop/out/Release
+          tdesktop/out/Debug
+        key: macos-build-${{ runner.os }}-${{ env.COMMIT_HASH }}-${{ hashFiles('tdesktop/Telegram/**/*.cpp', 'tdesktop/Telegram/**/*.h') }}
+        restore-keys: |
+          macos-build-${{ runner.os }}-${{ env.COMMIT_HASH }}-
+          macos-build-${{ runner.os }}-
+    
+    - name: Configure build
+      run: |
+        cd tdesktop/Telegram
+        ./configure.sh -D TDESKTOP_API_ID=${{ env.TDESKTOP_API_ID }} -D TDESKTOP_API_HASH=${{ env.TDESKTOP_API_HASH }}
+    
+    - name: Build with xcodebuild
+      run: |
+        cd tdesktop/out
+        
+        echo "开始构建 AyuGram..."
+        xcodebuild -project Telegram.xcodeproj \
+          -scheme Telegram \
+          -configuration Release \
+          -arch arm64 \
+          CODE_SIGN_IDENTITY="" \
+          CODE_SIGNING_REQUIRED=NO \
+          CODE_SIGNING_ALLOWED=NO \
+          | tee build.log \
+          | xcpretty --color || cat build.log
+    
+    - name: Check build output
+      run: |
+        echo "构建输出："
+        ls -lah tdesktop/out/Release/
+        du -sh tdesktop/out/
+        
+        if [ -d "tdesktop/out/Release/Telegram.app" ]; then
+          echo "✅ Telegram.app 构建成功！"
+          du -sh tdesktop/out/Release/Telegram.app
+        else
+          echo "❌ Telegram.app 未找到"
+          exit 1
+        fi
+    
+    - name: Create DMG
+      run: |
+        cd tdesktop/out/Release
+        if [ -d "Telegram.app" ]; then
+          echo "创建 DMG 安装包..."
+          hdiutil create -volname "AyuGram" -srcfolder Telegram.app -ov -format UDZO AyuGram-macOS.dmg
+          ls -lh AyuGram-macOS.dmg
+        fi
+    
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: AyuGram-macOS-${{ env.COMMIT_HASH }}
+        path: |
+          tdesktop/out/Release/Telegram.app
+          tdesktop/out/Release/*.dmg
+        retention-days: 7
+        compression-level: 6
+    
+    - name: Build summary
+      if: always()
+      run: |
+        echo "## 构建摘要 📊" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "- **提交:** ${{ env.COMMIT_HASH }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **架构:** arm64" >> $GITHUB_STEP_SUMMARY
+        echo "- **配置:** Release" >> $GITHUB_STEP_SUMMARY
+        echo "- **库缓存:** ${{ steps.cache-libs.outputs.cache-hit == 'true' && '✅ 命中' || '❌ 未命中' }}" >> $GITHUB_STEP_SUMMARY
+        
+        if [ -d "tdesktop/out/Release/Telegram.app" ]; then
+          echo "- **状态:** ✅ 构建成功" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "- **状态:** ❌ 构建失败" >> $GITHUB_STEP_SUMMARY
+        fi
+        
+        df -h >> $GITHUB_STEP_SUMMARY
+    
+    - name: Cleanup to save space
+      if: always()
+      run: |
+        echo "清理中间文件..."
+        rm -rf tdesktop/out/Release/*.o 2>/dev/null || true
+        rm -rf tdesktop/out/Release/*.a 2>/dev/null || true
+        df -h
